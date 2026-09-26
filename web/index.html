@@ -1,4 +1,162 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>藏品来源与返还审查</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>藏品来源与返还审查</h1><div class="panel"><select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select><button onclick="load()">查看当前角色可见藏品</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch("/api/objects",{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px;color:#222}
+select,button,input{padding:8px;margin:4px}button{cursor:pointer}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}
+.claim{border-top:1px dashed #bbb;padding-top:10px;margin-top:10px}
+.handover{background:#f8f8f4;border:1px solid #d8d8c8;border-radius:6px;padding:10px;margin:8px 0}
+.blocks{background:#fdecec;border:1px solid #e5a3a3;border-radius:6px;padding:8px;margin:6px 0}
+.blocks div{margin:2px 0}
+.ok{background:#e8f5e9;border:1px solid #a5d6a7;border-radius:6px;padding:8px;margin:6px 0}
+.timeline{font-size:13px;color:#555;margin:6px 0 0 16px}
+.muted{color:#777;font-size:13px}
+#msg{min-height:22px;font-weight:600}
+.err{color:#b00020}.fine{color:#1b5e20}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap;font-size:13px}
+.obj{cursor:pointer;padding:4px;border-bottom:1px solid #eee}.obj:hover{background:#f0f0f0}
+</style></head>
+<body>
+<h1>藏品来源与返还审查</h1>
+<div class="panel">
+  身份：<select id="user"><option>staff</option><option>reviewer1</option><option>claimant1</option><option>public</option></select>
+  <button onclick="loadObjects()">查看当前角色可见藏品</button>
+  <div id="msg"></div>
+</div>
+<div id="objects"></div>
+<div id="detail"></div>
+<script>
+const CLAIM_LABEL={submitted:"已提交",under_review:"审查中",negotiating:"协商中",return_in_progress:"交接中",resolved_return:"已返还",rejected:"已驳回"};
+const HO_LABEL={pending_outbound:"待出库",outbound:"已出库待签收",signed:"已签收",rejected:"已拒收",invalid:"已失效"};
+const TRANSITIONS={submitted:["under_review"],under_review:["negotiating","rejected"],negotiating:["rejected"]};
+const METHODS={on_site:"现场交接",courier:"馆方运送",third_party:"第三方物流"};
+const $=id=>document.getElementById(id);
+const me=()=>$("user").value;
+
+function note(t,ok){$("msg").textContent=t;$("msg").className=ok?"fine":"err"}
+function el(tag,text,cls){const e=document.createElement(tag);if(text!=null)e.textContent=text;if(cls)e.className=cls;return e}
+async function api(path,method,body){
+  const r=await fetch(path,{method:method||"GET",headers:{"X-User-Id":me(),"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error((d.error&&d.error.message)||("HTTP "+r.status));
+  return d;
+}
+async function run(fn){try{await fn()}catch(e){note(e.message,false)}}
+
+async function loadObjects(){run(async()=>{
+  const d=await api("/api/objects");
+  const box=$("objects");box.innerHTML="";$("detail").innerHTML="";
+  box.appendChild(el("h2","藏品列表"));
+  d.items.forEach(o=>{
+    const row=el("div",`#${o.id} ${o.inventory_no} ${o.title}（v${o.version}）`,"obj");
+    row.onclick=()=>loadObject(o.id);box.appendChild(row);
+  });
+  note(`已加载 ${d.items.length} 件藏品`,true);
+})}
+
+let currentObjectId=0;
+async function loadObject(id){currentObjectId=id;run(async()=>{
+  const o=await api("/api/objects/"+id);
+  const box=$("detail");box.innerHTML="";
+  const head=el("div",null,"panel");
+  head.appendChild(el("h2",`${o.inventory_no} ${o.title}（v${o.version}）`));
+  head.appendChild(el("div",`类型：${o.object_type}　简介：${o.public_summary}`,"muted"));
+  if(o.current_holder)head.appendChild(el("div",`当前持有人：${o.current_holder}`,"muted"));
+  box.appendChild(head);
+  (o.claims||[]).forEach(c=>box.appendChild(renderClaim(o,c)));
+  if(!(o.claims||[]).length)box.appendChild(el("div","当前角色下没有可见的主张记录。","muted"));
+  note("已加载藏品详情",true);
+})}
+
+function renderClaim(obj,c){
+  const panel=el("div",null,"panel");
+  panel.appendChild(el("h3",`主张 #${c.id}：${c.claimed_by} —— ${CLAIM_LABEL[c.status]||c.status}`));
+  panel.appendChild(el("div",`期望结果：${c.desired_outcome}`,"muted"));
+  (c.reviews||[]).forEach(r=>panel.appendChild(el("div",
+    `审查留痕：${CLAIM_LABEL[r.old_status]||r.old_status} → ${CLAIM_LABEL[r.new_status]||r.new_status}（${r.note}）`,"muted")));
+  (c.handovers||[]).forEach(h=>panel.appendChild(renderHandover(c,h)));
+  const role=me();
+  if(role==="reviewer1"||role==="reviewer"){
+    const targets=TRANSITIONS[c.status]||[];
+    if(targets.length){
+      const row=el("div");const sel=el("select");
+      targets.forEach(t=>{const op=el("option",CLAIM_LABEL[t]);op.value=t;sel.appendChild(op)});
+      const noteInput=el("input");noteInput.placeholder="审查说明（至少 5 字）";noteInput.size=24;
+      const btn=el("button","推进阶段");
+      btn.onclick=()=>run(async()=>{
+        await api(`/api/claims/${c.id}/transition`,"POST",{status:sel.value,note:noteInput.value});
+        note("阶段已更新",true);loadObject(obj.id);
+      });
+      row.append(sel,noteInput,btn);panel.appendChild(row);
+    }
+    if(c.status==="negotiating"){
+      const row=el("div");row.appendChild(el("b","创建返还交接单："));
+      const m=el("select");Object.entries(METHODS).forEach(([k,v])=>{const op=el("option",v);op.value=k;m.appendChild(op)});
+      const h=el("input");h.placeholder="经办人账号";h.value="staff";h.size=10;
+      const rn=el("input");rn.placeholder="接收人姓名";rn.size=10;
+      const ru=el("input");ru.placeholder="接收人账号(可空)";ru.size=14;
+      const btn=el("button","建单");
+      btn.onclick=()=>run(async()=>{
+        await api(`/api/claims/${c.id}/handovers`,"POST",{delivery_method:m.value,handler_id:h.value,receiver_name:rn.value,receiver_user_id:ru.value});
+        note("交接单已创建，主张进入交接中",true);loadObject(obj.id);
+      });
+      row.append(m,h,rn,ru,btn);panel.appendChild(row);
+    }
+    if(c.status==="return_in_progress")panel.appendChild(el("div","交接流程推进中：需出库并由接收人签收后，主张才会置为已返还。","muted"));
+  }
+  return panel;
+}
+
+function renderHandover(claim,h){
+  const box=el("div",null,"handover");
+  box.appendChild(el("b",`交接单 #${h.id} —— ${HO_LABEL[h.status]||h.status}`));
+  box.appendChild(el("div",`交付方式：${h.delivery_method_label||h.delivery_method}　经办人：${h.handler_id}　接收人：${h.receiver_name}${h.receiver_user_id?"（账号 "+h.receiver_user_id+"）":"（馆外接收人）"}`,"muted"));
+  box.appendChild(el("div",`冻结依据：藏品版本 v${h.frozen_object_version}，证据摘要 ${h.evidence_digest.slice(0,16)}…（${h.evidence_summary.length} 件证据）`,"muted"));
+  if(h.outbound_at)box.appendChild(el("div",`出库：${h.outbound_at}（${h.outbound_by}）`,"muted"));
+  if(h.signed_at)box.appendChild(el("div",`签收：${h.signed_at}（${h.signed_name}）`,"muted"));
+  if(h.reject_reason)box.appendChild(el("div",`拒收原因：${h.reject_reason}`,"muted"));
+  if(h.invalid_reason)box.appendChild(el("div",`失效原因：${h.invalid_reason}`,"muted"));
+  const detailBtn=el("button","阻塞原因 / 留痕");
+  const detailBox=el("div");
+  detailBtn.onclick=()=>run(async()=>{
+    const d=await api("/api/handovers/"+h.id);
+    detailBox.innerHTML="";
+    if(d.blocks&&d.blocks.length){
+      const b=el("div",null,"blocks");b.appendChild(el("b","当前阻塞："));
+      d.blocks.forEach(x=>b.appendChild(el("div","· "+x.message)));
+      detailBox.appendChild(b);
+    }else detailBox.appendChild(el("div","无阻塞，流程正常推进。","ok"));
+    const tl=el("div",null,"timeline");tl.appendChild(el("b","留痕："));
+    (d.events||[]).forEach(e=>tl.appendChild(el("div",`${e.created_at} ${e.actor_id} ${e.action} ${e.detail}`)));
+    detailBox.appendChild(tl);
+    detailBox.appendChild(el("div",`主张状态：${CLAIM_LABEL[d.claim_status]||d.claim_status}`,"muted"));
+  });
+  box.appendChild(detailBtn);
+  const role=me(),active=h.status==="pending_outbound"||h.status==="outbound";
+  if(role==="staff"&&h.status==="pending_outbound"){
+    const b=el("button","出库");b.onclick=()=>run(async()=>{
+      await api(`/api/handovers/${h.id}/outbound`,"POST",{});
+      note("已出库，等待接收人签收",true);reloadClaim(claim);
+    });box.appendChild(b);
+  }
+  const canReceive=h.receiver_user_id?me()===h.receiver_user_id:role==="staff";
+  if(active&&canReceive){
+    if(h.status==="outbound"){
+      const b=el("button","签收");b.onclick=()=>run(async()=>{
+        await api(`/api/handovers/${h.id}/sign`,"POST",{});
+        note("已签收，主张置为已返还",true);reloadClaim(claim);
+      });box.appendChild(b);
+    }
+    const r=el("button","拒收");r.onclick=()=>{
+      const reason=prompt("请填写拒收原因：");
+      if(reason!=null)run(async()=>{
+        await api(`/api/handovers/${h.id}/reject`,"POST",{reason});
+        note("已拒收，主张回到协商",true);reloadClaim(claim);
+      });
+    };box.appendChild(r);
+  }
+  box.appendChild(detailBox);
+  return box;
+}
+function reloadClaim(){if(currentObjectId)loadObject(currentObjectId)}
+</script>
+</body></html>
