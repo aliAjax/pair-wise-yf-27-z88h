@@ -1,0 +1,30 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>返还交接单</title>
+<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button,input{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}.order{border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0}.block{color:#a00;font-weight:bold}</style></head>
+<body><h1>返还交接单</h1>
+<div class="panel">身份：<select id="user"><option>reviewer1</option><option>staff</option></select>
+主张 ID：<input id="claimId" type="number" min="1" value="1">
+<button onclick="load()">查看交接单与阻塞原因</button>
+<button onclick="resolveReturn()">尝试置为已返还</button>
+<div id="block" class="block"></div></div>
+<div class="panel"><h2>建单（审查员，主张需在协商中）</h2>
+交付方式：<input id="method" placeholder="如：专人意送 / 物流保价">
+经办人：<input id="handler" placeholder="经办人姓名">
+接收人：<input id="receiver" placeholder="接收人姓名">
+<button onclick="create()">登记交接单</button></div>
+<div id="orders"></div>
+<pre id="out"></pre>
+<script>
+const H=()=>({"X-User-Id":user.value,"Content-Type":"application/json"});
+async function api(path,opt){const r=await fetch(path,opt);const j=await r.json();if(!r.ok)throw j;return j}
+async function load(){try{const j=await api(`/api/claims/${claimId.value}/handover`,{headers:H()});render(j);out.textContent=JSON.stringify(j,null,2)}catch(e){block.textContent="";orders.innerHTML="";out.textContent=JSON.stringify(e,null,2)}}
+function render(j){
+  block.textContent=j.block_reason?`阻塞原因：${j.block_reason}`:"交接完成，可置为已返还";
+  orders.innerHTML=j.items.map(o=>`<div class="order">#${o.id} [${o.status}] 交付方式：${o.delivery_method}　经办人：${o.handler}　接收人：${o.receiver}<br>冻结版本：v${o.frozen_object_version}　证据：${o.evidence_count} 份（${o.evidence_digest.slice(0,16)}…）${o.reject_reason?`<br>拒收原因：${o.reject_reason}`:""}${o.invalidation_reason?`<br>失效原因：${o.invalidation_reason}`:""}<br><button onclick="checkout(${o.id})">出库（工作人员）</button><button onclick="sign(${o.id})">签收</button><button onclick="rejectOrder(${o.id})">拒收</button></div>`).join("");
+}
+async function act(path,body){try{const j=await api(path,{method:"POST",headers:H(),body:JSON.stringify(body||{})});out.textContent=JSON.stringify(j,null,2);load()}catch(e){out.textContent=JSON.stringify(e,null,2)}}
+function create(){act(`/api/claims/${claimId.value}/handover`,{delivery_method:method.value,handler:handler.value,receiver:receiver.value})}
+function checkout(id){act(`/api/handover/${id}/checkout`)}
+function sign(id){act(`/api/handover/${id}/sign`)}
+function rejectOrder(id){const reason=prompt("请填写拒收原因");if(reason)act(`/api/handover/${id}/reject`,{reason})}
+function resolveReturn(){act(`/api/claims/${claimId.value}/transition`,{status:"resolved_return",note:"交接完成，确认返还。"})}
+</script></body></html>

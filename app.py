@@ -23,6 +23,32 @@ CLAIM_TRANSITIONS = {
     "rejected": set(),
 }
 
+# ---------- 返还交接单：规则（与留痕、页面入口分开维护） ----------
+HANDOVER_TRANSITIONS = {
+    "pending": {"checked_out", "rejected", "invalidated"},
+    "checked_out": {"received", "rejected", "invalidated"},
+    "received": set(),
+    "rejected": set(),
+    "invalidated": set(),
+}
+HANDOVER_ACTIVE = {"pending", "checked_out"}
+
+
+def handover_block_reason(order):
+    """根据最新交接单计算主张置为已返还的阻塞原因；返回 None 表示可流转。"""
+    if order is None:
+        return "尚未登记返还交接单，请先建单"
+    status = order["status"]
+    if status == "received":
+        return None
+    if status == "pending":
+        return f"交接单 #{order['id']} 待工作人员出库"
+    if status == "checked_out":
+        return f"交接单 #{order['id']} 待接收人签收"
+    if status == "rejected":
+        return f"交接单 #{order['id']} 已被拒收（{order['reject_reason']}），需重新建单"
+    return f"交接单 #{order['id']} 已失效（{order['invalidation_reason']}），需重核后重新建单"
+
 
 class BusinessError(Exception):
     def __init__(self, message, status=400, code="bad_request"):
@@ -112,6 +138,29 @@ class ProvenanceStore:
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
                     detail TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS handover_orders(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL REFERENCES claims(id),
+                    object_id INTEGER NOT NULL REFERENCES objects(id),
+                    delivery_method TEXT NOT NULL, handler TEXT NOT NULL, receiver TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','checked_out','received','rejected','invalidated')),
+                    frozen_object_version INTEGER NOT NULL,
+                    evidence_count INTEGER NOT NULL, evidence_digest TEXT NOT NULL,
+                    evidence_summary TEXT NOT NULL,
+                    checkout_by TEXT REFERENCES users(id), checkout_at TEXT,
+                    received_by TEXT REFERENCES users(id), received_at TEXT,
+                    reject_reason TEXT, rejected_at TEXT,
+                    invalidation_reason TEXT, invalidated_at TEXT,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS handover_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL REFERENCES handover_orders(id),
+                    actor_id TEXT NOT NULL REFERENCES users(id),
+                    action TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -197,6 +246,7 @@ class ProvenanceStore:
             )
             self._snapshot(conn, object_id, user_id)
             self._audit(conn, object_id, user_id, "object.update", {"version": new_version, "changes": clean})
+            self._invalidate_active_handovers(conn, object_id, user_id, f"藏品信息更新到版本 {new_version}")
             return {"id": object_id, "version": new_version, "changes": clean}
 
     def add_source(self, user_id, name, source_type, reference):
@@ -239,6 +289,7 @@ class ProvenanceStore:
             conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (new_version, now(), object_id))
             self._snapshot(conn, object_id, user_id)
             self._audit(conn, object_id, user_id, "event.add", {"event_id": cur.lastrowid, "version": new_version, "visibility": visibility})
+            self._invalidate_active_handovers(conn, object_id, user_id, f"新增流转事件 #{cur.lastrowid}，藏品版本升至 {new_version}")
             return {"id": cur.lastrowid, "object_id": object_id, "object_version": new_version}
 
     def upload_evidence(self, user_id, object_id, filename, content_b64, visibility, event_id=None):
@@ -262,6 +313,7 @@ class ProvenanceStore:
                 (object_id, event_id, filename.strip(), digest, len(content), content, visibility, user_id, now()),
             )
             self._audit(conn, object_id, user_id, "evidence.upload", {"evidence_id": cur.lastrowid, "sha256": digest, "visibility": visibility})
+            self._invalidate_active_handovers(conn, object_id, user_id, f"新增证据 {filename.strip()}")
             return {"id": cur.lastrowid, "filename": filename.strip(), "sha256": digest, "size": len(content)}
 
     def create_claim(self, user_id, object_id, claimed_by, desired_outcome):
@@ -291,12 +343,18 @@ class ProvenanceStore:
                 allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
                 if new_status not in allowed:
                     raise BusinessError(f"不能从 {claim['status']} 直接变更为 {new_status}", 409, "invalid_transition")
+                if new_status == "resolved_return":
+                    order = conn.execute(
+                        "SELECT * FROM handover_orders WHERE claim_id=? ORDER BY id DESC LIMIT 1", (claim_id,)
+                    ).fetchone()
+                    reason = handover_block_reason(order)
+                    if reason:
+                        raise BusinessError(f"主张不能置为已返还：{reason}", 409, "handover_required")
                 conn.execute("UPDATE claims SET status=?,updated_at=? WHERE id=?", (new_status, now(), claim_id))
                 conn.execute(
                     "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
                     (claim_id, user_id, claim["status"], new_status, note.strip(), now()),
                 )
-                new_version = claim["object_id"]
                 obj = self._object(conn, claim["object_id"])
                 next_version = obj["version"] + 1
                 conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (next_version, now(), claim["object_id"]))
@@ -306,6 +364,190 @@ class ProvenanceStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    # ---------- 返还交接单：流程与留痕 ----------
+    def _handover(self, conn, order_id):
+        row = conn.execute("SELECT * FROM handover_orders WHERE id=?", (order_id,)).fetchone()
+        if not row:
+            raise BusinessError("交接单不存在", 404, "not_found")
+        return row
+
+    def _handover_event(self, conn, order_id, actor, action, detail):
+        conn.execute(
+            "INSERT INTO handover_events(order_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
+            (order_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
+        )
+
+    def _handover_transition(self, order, new_status):
+        if new_status not in HANDOVER_TRANSITIONS.get(order["status"], set()):
+            raise BusinessError(f"交接单不能从 {order['status']} 变更为 {new_status}", 409, "invalid_handover_transition")
+
+    def _evidence_summary(self, conn, object_id):
+        rows = conn.execute(
+            "SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? ORDER BY id", (object_id,)
+        ).fetchall()
+        summary = [dict(r) for r in rows]
+        digest = hashlib.sha256("".join(r["sha256"] for r in rows).encode()).hexdigest()
+        return len(rows), digest, summary
+
+    def _invalidate_active_handovers(self, conn, object_id, actor, reason):
+        """藏品或证据变化时，让该藏品待交付的交接单即时失效。"""
+        rows = conn.execute(
+            "SELECT * FROM handover_orders WHERE object_id=? AND status IN ('pending','checked_out')", (object_id,)
+        ).fetchall()
+        for order in rows:
+            conn.execute(
+                "UPDATE handover_orders SET status='invalidated',invalidation_reason=?,invalidated_at=?,updated_at=? WHERE id=?",
+                (reason, now(), now(), order["id"]),
+            )
+            self._handover_event(conn, order["id"], actor, "invalidate", {"reason": reason})
+            self._audit(conn, object_id, actor, "handover.invalidate", {"order_id": order["id"], "reason": reason})
+        return len(rows)
+
+    def _check_handover_fresh(self, conn, order, actor):
+        """出库/签收前复核证据摘要；藏品内容变化已在写路径上即时失效，
+        主张流转本身不改变藏品与证据，不参与比对。"""
+        _, digest, _ = self._evidence_summary(conn, order["object_id"])
+        if digest != order["evidence_digest"]:
+            reason = "证据发生变化，交接单自动失效"
+            conn.execute(
+                "UPDATE handover_orders SET status='invalidated',invalidation_reason=?,invalidated_at=?,updated_at=? WHERE id=?",
+                (reason, now(), now(), order["id"]),
+            )
+            self._handover_event(conn, order["id"], actor, "invalidate", {"reason": reason})
+            self._audit(conn, order["object_id"], actor, "handover.invalidate", {"order_id": order["id"], "reason": reason})
+            raise BusinessError(f"交接单已失效：{reason}", 409, "handover_invalidated")
+
+    def create_handover(self, user_id, claim_id, delivery_method, handler, receiver):
+        delivery_method, handler, receiver = delivery_method.strip(), handler.strip(), receiver.strip()
+        if not delivery_method or not handler or not receiver:
+            raise BusinessError("交付方式、经办人和接收人不能为空", 422, "invalid_handover")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"reviewer"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                claim = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+                if not claim:
+                    raise BusinessError("权利主张不存在", 404, "not_found")
+                if claim["status"] != "negotiating":
+                    raise BusinessError("仅协商中的主张可以登记返还交接单", 409, "invalid_claim_stage")
+                active = conn.execute(
+                    "SELECT id FROM handover_orders WHERE claim_id=? AND status IN ('pending','checked_out')", (claim_id,)
+                ).fetchone()
+                if active:
+                    raise BusinessError(f"主张已有进行中的交接单 #{active['id']}", 409, "handover_active")
+                obj = self._object(conn, claim["object_id"])
+                count, digest, summary = self._evidence_summary(conn, claim["object_id"])
+                cur = conn.execute(
+                    """INSERT INTO handover_orders(claim_id,object_id,delivery_method,handler,receiver,
+                           frozen_object_version,evidence_count,evidence_digest,evidence_summary,created_by,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (claim_id, claim["object_id"], delivery_method, handler, receiver,
+                     obj["version"], count, digest, json.dumps(summary, ensure_ascii=False, sort_keys=True), user_id, now(), now()),
+                )
+                order_id = cur.lastrowid
+                detail = {"claim_id": claim_id, "delivery_method": delivery_method, "handler": handler,
+                          "receiver": receiver, "frozen_object_version": obj["version"], "evidence_digest": digest}
+                self._handover_event(conn, order_id, user_id, "create", detail)
+                self._audit(conn, claim["object_id"], user_id, "handover.create", {"order_id": order_id} | detail)
+                return {"id": order_id, "claim_id": claim_id, "object_id": claim["object_id"], "status": "pending",
+                        "frozen_object_version": obj["version"], "evidence_count": count, "evidence_digest": digest}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def checkout_handover(self, user_id, order_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                order = self._handover(conn, order_id)
+                self._check_handover_fresh(conn, order, user_id)
+                self._handover_transition(order, "checked_out")
+                conn.execute(
+                    "UPDATE handover_orders SET status='checked_out',checkout_by=?,checkout_at=?,updated_at=? WHERE id=?",
+                    (user_id, now(), now(), order_id),
+                )
+                self._handover_event(conn, order_id, user_id, "checkout", {"handler": order["handler"]})
+                self._audit(conn, order["object_id"], user_id, "handover.checkout", {"order_id": order_id})
+                return {"id": order_id, "status": "checked_out"}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def sign_handover(self, user_id, order_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                order = self._handover(conn, order_id)
+                self._check_handover_fresh(conn, order, user_id)
+                self._handover_transition(order, "received")
+                conn.execute(
+                    "UPDATE handover_orders SET status='received',received_by=?,received_at=?,updated_at=? WHERE id=?",
+                    (user_id, now(), now(), order_id),
+                )
+                self._handover_event(conn, order_id, user_id, "sign", {"receiver": order["receiver"]})
+                self._audit(conn, order["object_id"], user_id, "handover.sign", {"order_id": order_id})
+                return {"id": order_id, "status": "received"}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def reject_handover(self, user_id, order_id, reason):
+        reason = reason.strip()
+        if not reason:
+            raise BusinessError("拒收必须填写原因", 422, "reject_reason_required")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                order = self._handover(conn, order_id)
+                self._handover_transition(order, "rejected")
+                claim = conn.execute("SELECT * FROM claims WHERE id=?", (order["claim_id"],)).fetchone()
+                if claim["status"] in ("resolved_return", "rejected"):
+                    raise BusinessError("主张已处于终态，无法回退到协商", 409, "claim_finalized")
+                conn.execute(
+                    "UPDATE handover_orders SET status='rejected',reject_reason=?,rejected_at=?,updated_at=? WHERE id=?",
+                    (reason, now(), now(), order_id),
+                )
+                self._handover_event(conn, order_id, user_id, "reject", {"reason": reason})
+                old_status = claim["status"]
+                if old_status != "negotiating":
+                    conn.execute("UPDATE claims SET status='negotiating',updated_at=? WHERE id=?", (now(), claim["id"]))
+                    obj = self._object(conn, claim["object_id"])
+                    next_version = obj["version"] + 1
+                    conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (next_version, now(), claim["object_id"]))
+                    self._snapshot(conn, claim["object_id"], user_id)
+                conn.execute(
+                    "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
+                    (claim["id"], user_id, old_status, "negotiating", f"交接单 #{order_id} 被拒收：{reason}", now()),
+                )
+                self._audit(conn, order["object_id"], user_id, "handover.reject",
+                            {"order_id": order_id, "claim_id": claim["id"], "reason": reason})
+                return {"id": order_id, "status": "rejected", "claim_status": "negotiating"}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def get_handover(self, user_id, order_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            order = self._handover(conn, order_id)
+            events = conn.execute("SELECT * FROM handover_events WHERE order_id=? ORDER BY id", (order_id,)).fetchall()
+            return dict(order) | {"evidence_summary": json.loads(order["evidence_summary"]),
+                                  "events": [dict(e) for e in events]}
+
+    def list_claim_handovers(self, user_id, claim_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff", "reviewer"})
+            claim = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+            if not claim:
+                raise BusinessError("权利主张不存在", 404, "not_found")
+            rows = conn.execute("SELECT * FROM handover_orders WHERE claim_id=? ORDER BY id DESC", (claim_id,)).fetchall()
+            return {"claim_id": claim_id, "claim_status": claim["status"],
+                    "block_reason": handover_block_reason(rows[0] if rows else None),
+                    "items": [dict(r) for r in rows]}
 
     def get_object(self, user_id, object_id):
         with self.connect() as conn:
@@ -392,19 +634,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---------- 页面入口 ----------
+    def _page(self, name):
+        body = (BASE_DIR / "web" / name).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _dispatch(self, method):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         parts = [p for p in path.split("/") if p]
         user = self.headers.get("X-User-Id", "")
-        if method == "GET" and path == "/":
-            body = (BASE_DIR / "web" / "index.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+        if method == "GET" and path == "/": return self._page("index.html")
+        if method == "GET" and path == "/handover": return self._page("handover.html")
         if method == "GET" and path == "/health": return self._send(200, {"ok": True})
         store = self._store()
         if parts == ["api", "objects"] and method == "GET": return self._send(200, {"items": store.list_objects(user)})
@@ -426,6 +671,17 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 5 and parts[3] == "history" and method == "GET": return self._send(200, store.history_detail(user, object_id, int(parts[4])))
         if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "transition" and method == "POST":
             d = self._body(); return self._send(200, store.transition_claim(user, int(parts[2]), d.get("status", ""), d.get("note", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "claims"] and parts[3] == "handover":
+            if method == "POST":
+                d = self._body(); return self._send(201, store.create_handover(user, int(parts[2]), d.get("delivery_method", ""), d.get("handler", ""), d.get("receiver", "")))
+            if method == "GET": return self._send(200, store.list_claim_handovers(user, int(parts[2])))
+        if len(parts) >= 3 and parts[:2] == ["api", "handover"]:
+            order_id = int(parts[2])
+            if len(parts) == 3 and method == "GET": return self._send(200, store.get_handover(user, order_id))
+            if len(parts) == 4 and parts[3] == "checkout" and method == "POST": return self._send(200, store.checkout_handover(user, order_id))
+            if len(parts) == 4 and parts[3] == "sign" and method == "POST": return self._send(200, store.sign_handover(user, order_id))
+            if len(parts) == 4 and parts[3] == "reject" and method == "POST":
+                d = self._body(); return self._send(200, store.reject_handover(user, order_id, d.get("reason", "")))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method):
